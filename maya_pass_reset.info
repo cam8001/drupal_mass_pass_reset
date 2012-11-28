@@ -1,0 +1,7 @@
+name = Maya Password Reset
+description = Sends password reset emails to many users at once.
+package = Maya
+dependencies[] = user
+version = 7.x-1.0
+php = 5.3.x
+core = 7.x

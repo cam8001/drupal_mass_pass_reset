@@ -1,0 +1,344 @@
+<?php
+/**
+ * @file
+ * A form to bulk send password reset emails.
+ */
+
+// Url path to purge confirmation form.
+define('MAYA_PASS_RESET_PURGE_URI', 'admin/config/pass-reset/purge/confirm');
+define('MAYA_PASS_RESET_CONFIG_URI', 'admin/config/pass-reset/send/options');
+// Minimum user_pass_reset time. 30 minutes.
+define('MAYA_USER_PASS_RESET_MIN_TIME', 1800);
+
+/**
+ * Implements hook_menu().
+ */
+function maya_pass_reset_menu() {
+  $items['admin/config/pass-reset'] = array(
+    'title' => 'Mass password reset',
+    'position' => 'right',
+    'page callback' => 'system_admin_menu_block_page',
+    'access arguments' => array('administer pass reset'),
+    'file' => 'system.admin.inc',
+    'file path' => drupal_get_path('module', 'system'),
+    'weight' => -15,
+  );
+
+  $items['admin/config/pass-reset/send'] = array(
+    'title' => 'Send password reset emails',
+    'description' => 'Send a password reset email to many users at once.',
+    'position' => 'left',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('maya_pass_reset_form'),
+    'access arguments' => array('administer pass reset'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['admin/config/pass-reset/send/do'] = array(
+    'title' => 'Send mails',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+
+  $items[MAYA_PASS_RESET_CONFIG_URI] = array(
+    'title' => 'Sending options',
+    'description' => 'Set options for sending.',
+    'position' => 'right',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('maya_pass_reset_config_form'),
+    'access arguments' => array('administer pass reset'),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  $items[MAYA_PASS_RESET_PURGE_URI] = array(
+    'title' => 'Purge confirmation',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('maya_pass_reset_purge_form'),
+    'access arguments' => array('administer pass reset'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Form constructor for the pass reset form.
+ */
+function maya_pass_reset_form($form, &$form_state) {
+  // Load the date api for custom form elements.
+  module_load_include('inc', 'date_api', 'date_api_elements');
+
+
+  $form['uids_fieldset'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Users'),
+    '#description' => _maya_pass_reset_get_sent_summary_text(),
+  );
+
+
+  $form['uids_fieldset']['uids'] = array(
+    '#type' => 'textarea',
+    '#title' => t('User IDs of users to send a password reset email.'),
+  );
+
+  $form['uids_fieldset']['uids_file'] = array(
+    '#type' => 'file',
+    '#title' => t('Or, you can upload a file with the uids (one per line).'),
+  );
+
+  $form['user_filter_fieldset'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('User login options'),
+  );
+
+  $form['user_filter_fieldset']['exclude_logged_in'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Exclude users who have logged in after a certain time.'),
+    '#default_value' => TRUE,
+  );
+
+  $form['user_filter_fieldset']['logged_in_date'] = array(
+    '#type' => 'date_select',
+    '#title' => t('Logged in date'),
+    '#description' => t('Set this to the approximate date that this Maya site went live. Anyone who logged in after this date must have reset their password already.'),
+    // Default value is roughly the time we went live with syfy.de.
+    '#default_value' => '2012-07-20 17:00:00',
+  );
+
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Send emails'),
+  );
+
+  return $form;
+}
+
+/**
+ * Submit hook for pass reset form.
+ */
+function maya_pass_reset_form_submit($form, &$form_state) {
+  $uids = _maya_pass_reset_get_supplied_uids($form_state);
+  // Limit only to users who haven't already reset their password, if wanted.
+  $date = NULL;
+  if ($form_state['values']['exclude_logged_in'] == 1) {
+    $date = new DateObject($form_state['values']['logged_in_date']);
+    $date = $date->format('U');
+  }
+
+  $uids = _maya_pass_reset_filter_uids($uids, $date);
+
+  if (count($uids) > 0) {
+    module_load_include('inc', 'maya_pass_reset', 'maya_pass_reset.batch');
+    // Start up the batch to send out the mails.
+    $batch = maya_pass_reset_batch_send_mails_build($uids);
+    batch_set($batch);
+  }
+  else {
+    drupal_set_message('All of these users have either been sent mails, or have already reset their password.');
+  }
+}
+
+/**
+ * Gets a list of uids either from a file or a text input.
+ *
+ * @param array $form_state
+ *   $form_state from maya_pass_reset_form().
+ *
+ * @see maya_pass_reset_form()
+ */
+function _maya_pass_reset_get_supplied_uids(&$form_state) {
+  $file = file_save_upload(
+    'uids_file',
+    array(
+      'file_validate_extensions' => array('csv', 'tsv', 'txt'),
+    ),
+    FALSE,
+    FILE_EXISTS_RENAME
+  );
+  if ($file) {
+    $data = file_get_contents($file->uri);
+  }
+  else {
+    $data = $form_state['values']['uids'];
+  }
+  if (preg_match_all('|\d+|', $data, $matches)) {
+      $uids = $matches[0];
+  }
+  return $uids;
+}
+
+/**
+ * Sanitizes supplied uids by checking them against values in the local
+ * database.
+ *
+ * @param array $uids
+ *   A one dimensional array of uid ints.
+ * @param int $not_logged_in_after
+ *   A unix timestamp. Filter out users who have logged in after this time.
+ *
+ * @return array
+ *   A one dimensional array of uid ints.
+ */
+function _maya_pass_reset_filter_uids($uids, $not_logged_in_after = NULL) {
+  $query = db_select('users', 'u');
+  $query
+    ->fields('u', array('uid'))
+    ->condition('uid', $uids, 'IN');
+
+  $sent_uids = _maya_pass_reset_get_sent_uids();
+  if (empty($sent_uids) == FALSE) {
+      drupal_set_message(t('Excluding @count users who have already been sent reset emails.', array('@count' => count($sent_uids))));
+      $query->condition('uid', $sent_uids, 'NOT IN');
+  }
+
+  if (isset($not_logged_in_after)) {
+    $query->condition('access', (int) $not_logged_in_after, '<');
+  }
+
+  $result = $query->execute();
+
+  return array_unique($result->fetchCol('uid'));
+}
+
+/**
+ * Gets a list of the uids that have already been sent emails.
+ *
+ * @return array
+ *   One-dimensional array of uids.
+ */
+function _maya_pass_reset_get_sent_uids() {
+  return db_query('SELECT DISTINCT uid FROM {maya_pass_reset}')->fetchCol('uid');
+}
+
+/**
+ * Gets a text summary of users already sent mails.
+ *
+ * @return string
+ *   The text summary, passed through t().
+ */
+function _maya_pass_reset_get_sent_summary_text() {
+  $uids = _maya_pass_reset_get_sent_uids();
+  $summary = t('Emails have already been sent to @count users.', array('@count' => count($uids)));
+  return $summary;
+}
+
+/**
+ * Form constructor for mail send form.
+ */
+function maya_pass_reset_config_form($form, &$form_state) {
+
+  $form['options'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Sending options'),
+  );
+
+  $form['options']['maya_pass_reset_send_mails'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Send mails to live users'),
+    '#description' => t("Check this box to confirm you want to send mails. If you don't, no mails will be sent."),
+    '#default_value' => variable_get('maya_pass_reset_send_mails', FALSE),
+  );
+
+  $form['options']['maya_pass_sleep_time'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Sleep time between sending each mail'),
+    '#description' => t("Sleep for x millseconds between sending each mail. 1000 = 1 second. Use 0 for no sleep."),
+    '#default_value' => variable_get('maya_pass_sleep_time', 1000),
+  );
+
+  $form['options']['purge_sent'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Purge sent users'),
+    '#prefix' => '<div>',
+    '#description' => _maya_pass_reset_get_sent_summary_text(),
+    '#suffix' => '</div>',
+  );
+
+  $form['options']['purge_sent']['purge'] = array(
+    '#type' => 'button',
+    '#value' => t('Purge sent'),
+    '#suffix' => t('Delete all record of which users have already been sent mails.'),
+  );
+
+  $form = system_settings_form($form);
+
+  // Configurable user_pass_reset was added in Drupal 7.15.
+  if (VERSION >= 7.15) {
+    $form['options']['user_password_reset'] = array(
+      '#type' => 'textfield',
+      '#title' => t('User password reset timeout'),
+      '#description' => t('Timeout for user password reset links (seconds).'),
+      '#default_value' => variable_get('user_password_reset_timeout', 86400),
+    );
+    // Custom submit for user_password_reset handling.
+    array_unshift($form['#submit'], 'maya_pass_reset_config_form_submit');
+  }
+
+  $form['#validate'] = array('maya_pass_reset_config_form_validate');
+
+  return $form;
+}
+
+/**
+ * Form validation handler for maya_pass_reset_config_form().
+ */
+function maya_pass_reset_config_form_validate($form, &$form_state) {
+  if ($form_state['clicked_button']['#value'] == $form['options']['purge_sent']['purge']['#value']) {
+    drupal_goto(MAYA_PASS_RESET_PURGE_URI);
+  }
+
+  // Make sure sleep time is not too long, which may cause crashes.
+  $v = &$form_state['values'];
+  $max_execution_time = ini_get('max_execution_time');
+  $sleep_time = ($v['maya_pass_sleep_time'] / 1000);
+  if ($sleep_time >= $max_execution_time) {
+    $message = <<<MESSAGE
+This sleep time (@sleep_time seconds) is larger than your server's max_execution_time
+ (@max_time seconds). Try setting it comfortably underneath the max_execution_time to avoid time outs.
+MESSAGE;
+    $message = t($message, array('@sleep_time' => $sleep_time, '@max_time' => $max_execution_time));
+    form_set_error('maya_pass_sleep_time', $message);
+  }
+
+  // Don't allow the user to set unrealistically short timeouts for password
+  // reset links.
+  if (
+    array_key_exists('user_password_reset', $v) &&
+    (int) $v['user_password_reset'] < MAYA_USER_PASS_RESET_MIN_TIME
+  ) {
+    $message = 'The minimum password reset time is 30 minutes (@sec seconds).';
+    $message = t($message, array('@sec' => MAYA_USER_PASS_RESET_MIN_TIME));
+    form_set_error('user_password_reset', $message);
+  }
+}
+
+/**
+ * Form submission handler for maya_pass_reset_config_form().
+ */
+function maya_pass_reset_config_form_submit($form, &$form_state) {
+  variable_set('user_password_reset_timeout', (int) $form_state['values']['user_password_reset']);
+}
+
+/**
+ * Form constructor for purge data confirmation form.
+ *
+ * @see maya_pass_reset_purge_form_submit()
+ */
+function maya_pass_reset_purge_form() {
+  $form = array();
+  return confirm_form(
+    $form,
+    t('Are you sure you want to purge all record of password reset emails?'),
+    MAYA_PASS_RESET_CONFIG_URI,
+    _maya_pass_reset_get_sent_summary_text() . ' ' .  t('This action cannot be undone.')
+  );
+}
+
+/**
+ * Submit handler for purge data confirmation form.
+ */
+function maya_pass_reset_purge_form_submit() {
+  $result = db_query("DELETE FROM {maya_pass_reset}");
+  drupal_set_message(t('Purged @count records.', array('@count' => $result->rowCount())));
+  drupal_goto(MAYA_PASS_RESET_CONFIG_URI);
+}

@@ -1,0 +1,37 @@
+<?php
+/**
+ * @file
+ *
+ */
+
+/**
+ * Implements hook_schema().
+ */
+function maya_pass_reset_schema() {
+  $schema['maya_pass_reset'] = array(
+    'description' => 'A record of password reset mails sent as part of a mass mailing',
+    'fields' => array(
+      'uid' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => "User's {users}.uid.",
+      ),
+      'mail' => array(
+        'type' => 'varchar',
+        'length' => 254,
+        'not null' => FALSE,
+        'default' => '',
+        'description' => "User's e-mail address.",
+      ),
+      'sent' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => 'Timestamp for when mail was sent.',
+      ),
+     )
+  );
+
+  return $schema;
+}
